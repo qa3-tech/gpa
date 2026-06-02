@@ -1,0 +1,12 @@
+[
+  {
+    "directory": "/home/moore/src/gpa",
+    "command": "gcc -std=c23 -Wall -Wextra -Werror -Ivendor/testcracks-0.1.0/include -c -o build/testcracks.o vendor/testcracks-0.1.0/src/testcracks.c",
+    "file": "vendor/testcracks-0.1.0/src/testcracks.c"
+  },
+  {
+    "directory": "/home/moore/src/gpa",
+    "command": "gcc -std=c23 -Wall -Wextra -Werror -Iinclude/ -Ivendor/testcracks-0.1.0/include -c -o build/main.o tests/main.c",
+    "file": "tests/main.c"
+  }
+]

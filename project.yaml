@@ -1,0 +1,36 @@
+project:
+  name: gpa
+  language: c
+  standard: c23
+
+compiler:
+  compiler_path: gcc-14
+  flags: ["-Wall", "-Wextra", "-Werror"]
+  defines: []
+
+source_groups:
+  - name: vendor
+    source_dirs: ["vendor/testcracks-0.1.0/src"]
+    include_dirs: ["vendor/testcracks-0.1.0/include"]
+    flags: []
+    defines: []
+
+  - name: tests
+    source_dirs: ["tests/"]
+    include_dirs: ["include/", "vendor/testcracks-0.1.0/include"]
+    flags: []
+    defines: []
+
+build:
+  output: "test_gpa"
+
+  linker:
+    flags: []
+
+  modes:
+    debug:
+      output_dir: "build"
+      output_name: "test_gpa"
+      source_groups: ["vendor", "tests"]
+      extra_flags: []
+      linker_flags: []
