@@ -1,7 +1,6 @@
 # gpa.h
 
-Zig-inspired General Purpose Allocator for C23.  
-Single header. No dependencies beyond standard C.
+Zig-inspired General Purpose Allocator for C23. Single header. No dependencies beyond standard C.
 
 ---
 
@@ -20,10 +19,10 @@ zero overhead.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `gpa.h` | Allocator — drop into your project |
-| `test_gpa.c` | Tests (requires TestCracks) |
+| File                            | Purpose                                                               |
+| ------------------------------- | --------------------------------------------------------------------- |
+| `gpa.h`                         | Allocator — drop into your project                                    |
+| `test_gpa.c`                    | Tests (requires TestCracks)                                           |
 | `testcracks.h` / `testcracks.c` | Test framework ([TestCracks](https://github.com/qa3-tech/TestCracks)) |
 
 ---
@@ -43,17 +42,19 @@ int main(void) {
     p->y = 20;
     gpa_free(&alloc, p);
 
-    gpa_deinit(&alloc);   // prints "[gpa] deinit: clean"
+    gpa_deinit(&alloc);
     return 0;
 }
 ```
 
 Compile:
+
 ```sh
 gcc -std=c23 -o myapp myapp.c
 ```
 
 With log file:
+
 ```c
 Allocator alloc = gpa_init_log(libc_backing(), "gpa.log");
 ```
@@ -106,12 +107,12 @@ Allocator libc_allocator(void);   // identical vtable, malloc/free, zero overhea
 
 ## Guarantees
 
-| Situation | Behaviour |
-|---|---|
-| Leak at `gpa_deinit` | Logged to stderr and log file; memory freed; returns `true` |
-| Double-free | Logged; `abort()` called immediately |
-| Free of unknown pointer | Logged to stderr; execution continues |
-| Use-after-free | Freed slots zeroed — stale reads return zeros, not garbage |
+| Situation               | Behaviour                                                   |
+| ----------------------- | ----------------------------------------------------------- |
+| Leak at `gpa_deinit`    | Logged to stderr and log file; memory freed; returns `true` |
+| Double-free             | Logged; `abort()` called immediately                        |
+| Free of unknown pointer | Logged to stderr; execution continues                       |
+| Use-after-free          | Freed slots zeroed — stale reads return zeros, not garbage  |
 
 ---
 
@@ -178,6 +179,63 @@ never pass a size to `free`.
 
 ---
 
+## Interpreting Leak Output
+
+When `gpa_deinit` or `gpa_check` reports a leak, each line tells you three things:
+
+```
+[gpa] leak: 0x64ae2ad4e7e0  class 8  slot 0
+```
+
+**address** — the exact pointer that was never freed. Cross-reference against your
+code to identify the variable.
+
+**class** — the size bucket the allocation landed in. Always the smallest power of
+two >= your requested size:
+
+| You asked for | Class |
+| ------------- | ----- |
+| 1 – 8 bytes   | 8     |
+| 9 – 16 bytes  | 16    |
+| 17 – 32 bytes | 32    |
+| 33 – 64 bytes | 64    |
+| … and so on   | …     |
+
+So `class 8` means something 1–8 bytes — likely a small struct or scalar.
+`class 64` means something 33–64 bytes — a medium struct.
+
+**slot** — the position of that allocation within the class's page, in allocation
+order. Slot 0 was the first allocation of that class, slot 1 the second, and so on.
+Multiple leaks in the same class with consecutive slots means they were allocated
+together — a strong hint they came from the same code path.
+
+Large allocations (> 2048 bytes) bypass the bucket system and report differently:
+
+```
+[gpa] leak large: 0x64ae2ad4e7e0  size 8192
+```
+
+Here `size` is the actual page-rounded allocation size, not a class.
+
+### Narrowing down a leak
+
+Use `gpa_snapshot` / `gpa_check` to bracket suspect code:
+
+```c
+GpaSnapshot snap = gpa_snapshot(&alloc);
+
+// suspect block
+Point* p = gpa_malloc(&alloc, sizeof(Point));
+
+if (gpa_check(&alloc, snap)) {
+    gpa_dump(&alloc);   // prints every live address + class + slot
+}
+```
+
+Wrap progressively smaller blocks until the leak isolates to a single allocation.
+The slot number gives you allocation order within that class — useful when the
+same struct type leaks multiple times.
+
 ## Building Tests
 
 ```sh
@@ -191,6 +249,7 @@ gcc -std=c23 -Wall -Wextra -Werror -o test_gpa test_gpa.c testcracks.c
 ```
 
 Expected output:
+
 ```
 === Basics ===
   ✓ clean alloc and free
@@ -228,4 +287,3 @@ No special configuration needed — `gpa.h` is a single header.
 
 - POSIX only for `mmap_backing()`; `libc_backing()` works everywhere
 - No stack trace capture on alloc/free (requires platform unwinding — out of scope)
-
