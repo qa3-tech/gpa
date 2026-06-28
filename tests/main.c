@@ -9,7 +9,6 @@ typedef struct {
   int x;
   int y;
 } Point;
-
 typedef struct {
   char name[32];
   int age;
@@ -359,6 +358,37 @@ static TestResult test_fill_page_no_header_corruption(void *env) {
   return r;
 }
 
+static TestResult test_bucket_header_alignment(void *env) {
+  (void)env;
+  /* Every bucket header sits at the page end; it must stay aligned to
+     _Alignof(Bucket) or its size_t/pointer fields are misaligned (UB). One
+     allocation per class forces that class's bucket into existence; we then
+     recover the header and check its address and that no slot runs into it.
+     Guards the page-layout fix without needing a sanitizer build. */
+  Allocator a = gpa_init(libc_backing());
+  GpaState *s = (GpaState *)a.ctx;
+
+  TestResult r = tc_pass();
+  for (size_t i = 0; i < GPA_NUM_SIZE_CLASSES; i++) {
+    void *p = gpa_malloc(&a, GPA_SIZE_CLASSES[i]);
+    r = tc_combine(r, tc_assert_not_nil(p, "class allocation non-null"));
+
+    size_t sci;
+    Bucket *b = _gpa_bucket_owning(s, p, &sci);
+    r = tc_combine(r, tc_assert_not_nil(b, "owning bucket found"));
+    r = tc_combine(
+        r, tc_assert_equal_size(0, (size_t)((uintptr_t)b % _Alignof(Bucket)),
+                                "header is aligned"));
+    r = tc_combine(r, tc_assert_true(b->slot_count * b->size_class <=
+                                         _gpa_bucket_offset(b->size_class),
+                                     "slots stay below the header"));
+    gpa_free(&a, p);
+  }
+
+  bool leaked = gpa_deinit(&a);
+  return tc_combine(r, tc_assert_false(leaked, "alignment sweep clean"));
+}
+
 static TestResult test_size_class_boundary(void *env) {
   (void)env;
   /* white-box: the table tops out at 2048; nothing larger is bucketed */
@@ -455,6 +485,8 @@ int main(int argc, char **argv) {
   Suite robustness = tc_suite(
       "Robustness", (Test[]){{.name = "full page write leaves header intact",
                               .fn = test_fill_page_no_header_corruption},
+                             {.name = "bucket headers stay aligned",
+                              .fn = test_bucket_header_alignment},
                              {.name = "size-class boundary at 2048",
                               .fn = test_size_class_boundary},
                              {0}});

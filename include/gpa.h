@@ -118,12 +118,15 @@ struct Bucket {
 };
 
 static inline size_t _gpa_slots_for(size_t sc) {
-  /* Largest slot count whose slots + Bucket header + used_bits all fit one
-     page:  n*sc + sizeof(Bucket) + ceil(n/8) <= GPA_PAGE_SIZE.
-     With ceil(n/8) <= (n+7)/8, solving for n gives the closed form below.
+  /* Largest slot count whose slots, the Bucket header, its used_bits, AND up
+     to alignof(Bucket)-1 bytes of header padding all fit one page:
+       n*sc + sizeof(Bucket) + ceil(n/8) + (alignof(Bucket)-1) <= GPA_PAGE_SIZE.
+     With ceil(n/8) <= (n+7)/8, solving for n gives the closed form below. The
+     padding reserve lets _gpa_bucket_offset round the header down to its
+     alignment without ever colliding with the last slot.
      No clamp to 1: a class too large to seat even one slot must be left out
      of GPA_SIZE_CLASSES (the largest kept class, 2048, yields exactly 1). */
-  size_t avail = GPA_PAGE_SIZE - sizeof(Bucket);
+  size_t avail = GPA_PAGE_SIZE - sizeof(Bucket) - (_Alignof(Bucket) - 1u);
   return (8u * avail - 7u) / (8u * sc + 1u);
 }
 
@@ -132,8 +135,14 @@ static inline size_t _gpa_used_bytes(size_t slot_count) {
 }
 
 static inline size_t _gpa_bucket_offset(size_t sc) {
+  /* Header sits at the page end, rounded DOWN to its own alignment so its
+     size_t / pointer fields are never misaligned. The page base is at least
+     alignof(Bucket)-aligned (malloc/mmap give >= 8), so page + aligned offset
+     is aligned too. _gpa_slots_for reserved the rounding slack, so the aligned
+     header never overlaps the last slot. */
   size_t n = _gpa_slots_for(sc);
-  return GPA_PAGE_SIZE - (sizeof(Bucket) + _gpa_used_bytes(n));
+  size_t raw = GPA_PAGE_SIZE - (sizeof(Bucket) + _gpa_used_bytes(n));
+  return raw & ~(_Alignof(Bucket) - 1u);
 }
 
 static inline Bucket *_gpa_bucket_from_page(void *page, size_t sc) {
