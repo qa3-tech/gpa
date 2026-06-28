@@ -3,7 +3,7 @@
  * Copyright (c) 2026 QA3 Technologies LLC
  * SPDX-License-Identifier: MIT
  * https://github.com/qa3-tech/gpa
- * 
+ *
  * Single header, no dependencies beyond standard C.
  *
  * USAGE
@@ -11,42 +11,30 @@
  *
  * API
  *   Backing   libc_backing(void);
- *   Backing   mmap_backing(void);          // POSIX only; falls back to libc elsewhere
+ *   Backing   mmap_backing(void);          // POSIX only; falls back to libc
  *
  *   Allocator gpa_init    (Backing b);
  *   Allocator gpa_init_log(Backing b, const char* log_path);
- *   bool      gpa_deinit  (Allocator* a);  // true = leaks found; frees all remaining memory
+ *   bool      gpa_deinit  (Allocator* a);  // true = leaks found; frees all
  *
  *   void*  gpa_malloc (Allocator* a, size_t size);
  *   void*  gpa_realloc(Allocator* a, void* ptr, size_t new_size);
  *   void   gpa_free   (Allocator* a, void* ptr);  // no size needed
  *
- *   // debug inspection
- *   GpaSnapshot gpa_snapshot  (Allocator* a);            // mark a known-clean point
- *   bool        gpa_check     (Allocator* a, GpaSnapshot s); // true = leaks since snap
- *   void        gpa_dump      (Allocator* a);            // log every live allocation
+ *   GpaSnapshot gpa_snapshot  (Allocator* a);
+ *   bool        gpa_check     (Allocator* a, GpaSnapshot s);
+ *   void        gpa_dump      (Allocator* a);
  *   size_t      gpa_live_count(Allocator* a);
  *
- *   // release swap — identical vtable, zero overhead
- *   Allocator libc_allocator(void);
- *
- * LEAK REMEDIATION
- *   1. Call gpa_snapshot() at a known-clean point.
- *   2. Run the suspect code.
- *   3. Call gpa_check() — returns true if anything leaked since the snapshot.
- *   4. Call gpa_dump() — logs every live allocation (address, size-class, slot).
- *   5. Cross-reference addresses with your alloc calls to find the culprit.
- *   6. gpa_deinit() always frees all remaining memory, leaked or not.
+ *   Allocator libc_allocator(void);         // release swap, zero overhead
  *
  * GUARANTEES
- *   - Double-free: aborts immediately with a message to stderr and log.
- *   - Unknown pointer free: logs error, does not abort (safe to continue).
- *   - Use-after-free: freed slots are zeroed — catches stale reads early.
+ *   - Double-free (bucketed, <=2048): aborts immediately, message to
+ * stderr+log.
+ *   - Double-free (large, >2048): reported as unknown-pointer free; no abort.
+ *   - Unknown pointer free: logs error, does not abort.
+ *   - Use-after-free: freed slots are zeroed.
  *   - Leak detection: gpa_deinit() reports every unreleased allocation.
- *
- * RELEASE SWAP
- *   Replace gpa_init(...) with libc_allocator() — same vtable, malloc/free underneath.
- *   All gpa_* calls still compile; debug functions become no-ops.
  */
 
 #pragma once
@@ -89,20 +77,6 @@ struct Allocator {
   void *ctx;
 };
 
-/* -------------------------------------------------------------------------
- * Forward declarations
- * ---------------------------------------------------------------------- */
-
-Backing libc_backing(void);
-Backing mmap_backing(void);
-Allocator gpa_init(Backing b);
-Allocator gpa_init_log(Backing b, const char *log_path);
-bool gpa_deinit(Allocator *a);
-void *gpa_malloc(Allocator *a, size_t size);
-void *gpa_realloc(Allocator *a, void *ptr, size_t new_size);
-void gpa_free(Allocator *a, void *ptr);
-Allocator libc_allocator(void);
-
 /* debug wrappers — safe to call on libc_allocator (no-ops) */
 static inline GpaSnapshot gpa_snapshot(Allocator *a) {
   return a->snapshot ? a->snapshot(a->ctx) : (GpaSnapshot){0};
@@ -119,28 +93,18 @@ static inline size_t gpa_live_count(Allocator *a) {
 }
 
 /* =========================================================================
- * IMPLEMENTATION — included once via the header (static functions only)
+ * IMPLEMENTATION — static inline throughout; safe in any number of TUs
  * ====================================================================== */
 
-/* -------------------------------------------------------------------------
- * Constants
- * ---------------------------------------------------------------------- */
-
 #define GPA_PAGE_SIZE 4096u
-#define GPA_LARGE_THRESHOLD (GPA_PAGE_SIZE / 2u) /* 2048 */
-#define GPA_NUM_SIZE_CLASSES 10u
+#define GPA_NUM_SIZE_CLASSES 9u
 #define GPA_MAX_LOG_PATH 256u
 
-static const size_t GPA_SIZE_CLASSES[GPA_NUM_SIZE_CLASSES] = {
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+[[maybe_unused]] static const size_t GPA_SIZE_CLASSES[GPA_NUM_SIZE_CLASSES] = {
+    8, 16, 32, 64, 128, 256, 512, 1024, 2048};
 
 /* -------------------------------------------------------------------------
  * Bucket
- *
- * Layout of a backing page:
- *   [ slot[0] | slot[1] | ... | slot[N-1] | ... | BucketHeader + used_bits ]
- *
- * BucketHeader sits at the END of the page so slot[0] address == page base.
  * ---------------------------------------------------------------------- */
 
 typedef struct Bucket Bucket;
@@ -154,8 +118,13 @@ struct Bucket {
 };
 
 static inline size_t _gpa_slots_for(size_t sc) {
-  size_t n = GPA_PAGE_SIZE / sc;
-  return n < 1 ? 1 : n;
+  /* Largest slot count whose slots + Bucket header + used_bits all fit one
+     page:  n*sc + sizeof(Bucket) + ceil(n/8) <= GPA_PAGE_SIZE.
+     With ceil(n/8) <= (n+7)/8, solving for n gives the closed form below.
+     No clamp to 1: a class too large to seat even one slot must be left out
+     of GPA_SIZE_CLASSES (the largest kept class, 2048, yields exactly 1). */
+  size_t avail = GPA_PAGE_SIZE - sizeof(Bucket);
+  return (8u * avail - 7u) / (8u * sc + 1u);
 }
 
 static inline size_t _gpa_used_bytes(size_t slot_count) {
@@ -221,7 +190,7 @@ struct GpaState {
  * Logging
  * ---------------------------------------------------------------------- */
 
-static void _gpa_log(GpaState *s, const char *fmt, ...) {
+static inline void _gpa_log(GpaState *s, const char *fmt, ...) {
   if (!s->log)
     return;
   va_list ap;
@@ -231,7 +200,7 @@ static void _gpa_log(GpaState *s, const char *fmt, ...) {
   fflush(s->log);
 }
 
-static void _gpa_log_init(GpaState *s) {
+static inline void _gpa_log_init(GpaState *s) {
   if (!s->log)
     return;
   time_t t = time(nullptr);
@@ -245,46 +214,46 @@ static void _gpa_log_init(GpaState *s) {
  * Backing implementations
  * ---------------------------------------------------------------------- */
 
-static void *_libc_alloc_pages(size_t size, void *ctx) {
+static inline void *_libc_alloc_pages(size_t size, void *ctx) {
   (void)ctx;
   return malloc(size);
 }
-static void _libc_free_pages(void *ptr, size_t size, void *ctx) {
+static inline void _libc_free_pages(void *ptr, size_t size, void *ctx) {
   (void)ctx;
   (void)size;
   free(ptr);
 }
 
-Backing libc_backing(void) {
+static inline Backing libc_backing(void) {
   return (Backing){.alloc_pages = _libc_alloc_pages,
                    .free_pages = _libc_free_pages};
 }
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
-static void *_mmap_alloc_pages(size_t size, void *ctx) {
+static inline void *_mmap_alloc_pages(size_t size, void *ctx) {
   (void)ctx;
   void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   return (p == MAP_FAILED) ? nullptr : p;
 }
-static void _mmap_free_pages(void *ptr, size_t size, void *ctx) {
+static inline void _mmap_free_pages(void *ptr, size_t size, void *ctx) {
   (void)ctx;
   munmap(ptr, size);
 }
-Backing mmap_backing(void) {
+static inline Backing mmap_backing(void) {
   return (Backing){.alloc_pages = _mmap_alloc_pages,
                    .free_pages = _mmap_free_pages};
 }
 #else
-Backing mmap_backing(void) { return libc_backing(); }
+static inline Backing mmap_backing(void) { return libc_backing(); }
 #endif
 
 /* -------------------------------------------------------------------------
  * Size class lookup
  * ---------------------------------------------------------------------- */
 
-static int _gpa_sc_index(size_t size) {
+static inline int _gpa_sc_index(size_t size) {
   for (int i = 0; i < (int)GPA_NUM_SIZE_CLASSES; i++)
     if (GPA_SIZE_CLASSES[i] >= size)
       return i;
@@ -295,7 +264,7 @@ static int _gpa_sc_index(size_t size) {
  * Bucket management
  * ---------------------------------------------------------------------- */
 
-static Bucket *_gpa_bucket_alloc(GpaState *s, size_t sc_idx) {
+static inline Bucket *_gpa_bucket_alloc(GpaState *s, size_t sc_idx) {
   void *page = s->backing.alloc_pages(GPA_PAGE_SIZE, s->backing.ctx);
   if (!page)
     return nullptr;
@@ -309,12 +278,12 @@ static Bucket *_gpa_bucket_alloc(GpaState *s, size_t sc_idx) {
   return b;
 }
 
-static void _gpa_bucket_free(GpaState *s, Bucket *b) {
+static inline void _gpa_bucket_free(GpaState *s, Bucket *b) {
   s->backing.free_pages(_gpa_page_from_bucket(b), GPA_PAGE_SIZE,
                         s->backing.ctx);
 }
 
-static Bucket *_gpa_bucket_with_slot(GpaState *s, size_t sc_idx) {
+static inline Bucket *_gpa_bucket_with_slot(GpaState *s, size_t sc_idx) {
   Bucket *head = s->buckets[sc_idx];
   if (head && head->used_count < head->slot_count)
     return head;
@@ -341,7 +310,8 @@ static Bucket *_gpa_bucket_with_slot(GpaState *s, size_t sc_idx) {
   return nb;
 }
 
-static Bucket *_gpa_bucket_owning(GpaState *s, void *ptr, size_t *sc_idx_out) {
+static inline Bucket *_gpa_bucket_owning(GpaState *s, void *ptr,
+                                         size_t *sc_idx_out) {
   for (size_t i = 0; i < GPA_NUM_SIZE_CLASSES; i++) {
     Bucket *head = s->buckets[i];
     if (!head)
@@ -366,7 +336,7 @@ static Bucket *_gpa_bucket_owning(GpaState *s, void *ptr, size_t *sc_idx_out) {
  * Large allocation helpers
  * ---------------------------------------------------------------------- */
 
-static void *_gpa_large_alloc(GpaState *s, size_t size) {
+static inline void *_gpa_large_alloc(GpaState *s, size_t size) {
   size_t pages = (size + GPA_PAGE_SIZE - 1) / GPA_PAGE_SIZE;
   size_t total = pages * GPA_PAGE_SIZE;
   void *ptr = s->backing.alloc_pages(total, s->backing.ctx);
@@ -384,7 +354,7 @@ static void *_gpa_large_alloc(GpaState *s, size_t size) {
   return ptr;
 }
 
-static bool _gpa_large_free(GpaState *s, void *ptr) {
+static inline bool _gpa_large_free(GpaState *s, void *ptr) {
   LargeAlloc **cur = &s->large_head;
   while (*cur) {
     if ((*cur)->ptr == ptr) {
@@ -403,7 +373,7 @@ static bool _gpa_large_free(GpaState *s, void *ptr) {
  * Core vtable functions
  * ---------------------------------------------------------------------- */
 
-static void *_gpa_malloc(size_t size, void *ctx) {
+static inline void *_gpa_malloc(size_t size, void *ctx) {
   if (!size)
     return nullptr;
   GpaState *s = (GpaState *)ctx;
@@ -441,7 +411,7 @@ static void *_gpa_malloc(size_t size, void *ctx) {
   return nullptr;
 }
 
-static void _gpa_free(void *ptr, void *ctx) {
+static inline void _gpa_free(void *ptr, void *ctx) {
   if (!ptr)
     return;
   GpaState *s = (GpaState *)ctx;
@@ -473,7 +443,7 @@ static void _gpa_free(void *ptr, void *ctx) {
            slot);
 }
 
-static void *_gpa_realloc(void *ptr, size_t new_size, void *ctx) {
+static inline void *_gpa_realloc(void *ptr, size_t new_size, void *ctx) {
   if (!ptr)
     return _gpa_malloc(new_size, ctx);
   if (!new_size) {
@@ -518,11 +488,11 @@ static void *_gpa_realloc(void *ptr, size_t new_size, void *ctx) {
  * Debug vtable functions
  * ---------------------------------------------------------------------- */
 
-static GpaSnapshot _gpa_snapshot(void *ctx) {
+static inline GpaSnapshot _gpa_snapshot(void *ctx) {
   return (GpaSnapshot){.live_count = ((GpaState *)ctx)->live_count};
 }
 
-static bool _gpa_check(void *ctx, GpaSnapshot snap) {
+static inline bool _gpa_check(void *ctx, GpaSnapshot snap) {
   GpaState *s = (GpaState *)ctx;
   bool leaked = s->live_count > snap.live_count;
   if (leaked) {
@@ -533,7 +503,7 @@ static bool _gpa_check(void *ctx, GpaSnapshot snap) {
   return leaked;
 }
 
-static void _gpa_dump(void *ctx) {
+static inline void _gpa_dump(void *ctx) {
   GpaState *s = (GpaState *)ctx;
   _gpa_log(s, "[gpa] dump: %zu live allocation(s)\n", s->live_count);
   fprintf(stderr, "[gpa] dump: %zu live allocation(s)\n", s->live_count);
@@ -569,7 +539,7 @@ static void _gpa_dump(void *ctx) {
   }
 }
 
-static size_t _gpa_live_count(void *ctx) {
+static inline size_t _gpa_live_count(void *ctx) {
   return ((GpaState *)ctx)->live_count;
 }
 
@@ -577,7 +547,7 @@ static size_t _gpa_live_count(void *ctx) {
  * Public init / deinit
  * ---------------------------------------------------------------------- */
 
-static Allocator _gpa_make(GpaState *s) {
+static inline Allocator _gpa_make(GpaState *s) {
   return (Allocator){
       .malloc = _gpa_malloc,
       .realloc = _gpa_realloc,
@@ -590,16 +560,18 @@ static Allocator _gpa_make(GpaState *s) {
   };
 }
 
-static GpaState *_gpa_state_new(Backing b) {
+static inline GpaState *_gpa_state_new(Backing b) {
   GpaState *s = (GpaState *)calloc(1, sizeof(GpaState));
   if (s)
     s->backing = b;
   return s;
 }
 
-Allocator gpa_init(Backing b) { return _gpa_make(_gpa_state_new(b)); }
+static inline Allocator gpa_init(Backing b) {
+  return _gpa_make(_gpa_state_new(b));
+}
 
-Allocator gpa_init_log(Backing b, const char *log_path) {
+static inline Allocator gpa_init_log(Backing b, const char *log_path) {
   GpaState *s = _gpa_state_new(b);
   if (s && log_path) {
     s->log = fopen(log_path, "w");
@@ -611,7 +583,7 @@ Allocator gpa_init_log(Backing b, const char *log_path) {
   return _gpa_make(s);
 }
 
-bool gpa_deinit(Allocator *a) {
+static inline bool gpa_deinit(Allocator *a) {
   if (!a || !a->ctx)
     return false;
   GpaState *s = (GpaState *)a->ctx;
@@ -677,33 +649,34 @@ bool gpa_deinit(Allocator *a) {
  * Convenience wrappers
  * ---------------------------------------------------------------------- */
 
-void *gpa_malloc(Allocator *a, size_t size) { return a->malloc(size, a->ctx); }
-void *gpa_realloc(Allocator *a, void *p, size_t new_size) {
+static inline void *gpa_malloc(Allocator *a, size_t size) {
+  return a->malloc(size, a->ctx);
+}
+static inline void *gpa_realloc(Allocator *a, void *p, size_t new_size) {
   return a->realloc(p, new_size, a->ctx);
 }
-void gpa_free(Allocator *a, void *p) { a->free(p, a->ctx); }
+static inline void gpa_free(Allocator *a, void *p) { a->free(p, a->ctx); }
 
 /* -------------------------------------------------------------------------
  * libc_allocator — release swap
  * ---------------------------------------------------------------------- */
 
-static void *_la_malloc(size_t s, void *ctx) {
+static inline void *_la_malloc(size_t s, void *ctx) {
   (void)ctx;
   return malloc(s);
 }
-static void *_la_realloc(void *p, size_t s, void *ctx) {
+static inline void *_la_realloc(void *p, size_t s, void *ctx) {
   (void)ctx;
   return realloc(p, s);
 }
-static void _la_free(void *p, void *ctx) {
+static inline void _la_free(void *p, void *ctx) {
   (void)ctx;
   free(p);
 }
 
-Allocator libc_allocator(void) {
+static inline Allocator libc_allocator(void) {
   return (Allocator){
       .malloc = _la_malloc, .realloc = _la_realloc, .free = _la_free,
-      /* debug fields intentionally null — gpa_* wrappers handle nullptr safely
-       */
+      /* debug fields intentionally null — gpa_* wrappers handle nullptr */
   };
 }

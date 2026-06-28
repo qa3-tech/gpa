@@ -15,6 +15,9 @@ through it. In development you pass a `gpa_init(...)` allocator and get full
 diagnostics. In release you swap in `libc_allocator()` — one line, zero other changes,
 zero overhead.
 
+Every function is `static inline`, so you can `#include "gpa.h"` from any number of
+translation units with no separate `.c` to compile and no duplicate-symbol link errors.
+
 ---
 
 ## Files
@@ -22,7 +25,8 @@ zero overhead.
 | File                            | Purpose                                                               |
 | ------------------------------- | --------------------------------------------------------------------- |
 | `gpa.h`                         | Allocator — drop into your project                                    |
-| `test_gpa.c`                    | Tests (requires TestCracks)                                           |
+| `tests/main.c`                  | Test entry point (requires TestCracks)                                |
+| `tests/second_tu.c`             | Second TU — guards multi-TU linkage                                   |
 | `testcracks.h` / `testcracks.c` | Test framework ([TestCracks](https://github.com/qa3-tech/TestCracks)) |
 
 ---
@@ -49,7 +53,7 @@ int main(void) {
 
 Compile:
 
-```sh
+```
 gcc -std=c23 -o myapp myapp.c
 ```
 
@@ -89,7 +93,7 @@ Backing mmap_backing(void);   // mmap/munmap — POSIX; falls back to libc elsew
 ### Debug inspection
 
 ```c
-GpaSnapshot gpa_snapshot  (Allocator* a);             // mark a known-clean point
+GpaSnapshot gpa_snapshot  (Allocator* a);              // mark a known-clean point
 bool        gpa_check     (Allocator* a, GpaSnapshot); // true = leaks since snapshot
 void        gpa_dump      (Allocator* a);              // log every live allocation
 size_t      gpa_live_count(Allocator* a);
@@ -107,12 +111,19 @@ Allocator libc_allocator(void);   // identical vtable, malloc/free, zero overhea
 
 ## Guarantees
 
-| Situation               | Behaviour                                                   |
-| ----------------------- | ----------------------------------------------------------- |
-| Leak at `gpa_deinit`    | Logged to stderr and log file; memory freed; returns `true` |
-| Double-free             | Logged; `abort()` called immediately                        |
-| Free of unknown pointer | Logged to stderr; execution continues                       |
-| Use-after-free          | Freed slots zeroed — stale reads return zeros, not garbage  |
+| Situation                     | Behaviour                                                   |
+| ----------------------------- | ----------------------------------------------------------- |
+| Leak at `gpa_deinit`          | Logged to stderr and log file; memory freed; returns `true` |
+| Double-free (bucketed, ≤2048) | Logged; `abort()` called immediately                        |
+| Double-free (large, >2048)    | Reported as an unknown-pointer free; execution continues    |
+| Free of unknown pointer       | Logged to stderr; execution continues                       |
+| Use-after-free                | Freed slots zeroed — stale reads return zeros, not garbage  |
+
+Double-free detection differs by allocation size. A bucketed allocation carries
+a per-slot used-bit, so freeing it twice is caught and aborts. A large
+allocation is removed from its list on the first free, so a second free can no
+longer be distinguished from a stray pointer — it is logged as
+`free of unknown pointer` and execution continues rather than aborting.
 
 ---
 
@@ -170,12 +181,45 @@ become no-ops automatically.
 Small allocations map to the smallest size class >= the requested size:
 
 ```
-8  16  32  64  128  256  512  1024  2048  4096
+8  16  32  64  128  256  512  1024  2048
 ```
 
-Allocations above 2048 bytes go to a large-allocation list (page-aligned,
-tracked separately). `gpa_free` recovers the size from the bucket — you
-never pass a size to `free`.
+Allocations above 2048 bytes go to a separate large-allocation list, rounded up
+to a whole number of 4096-byte pages. `gpa_free` recovers the size from the
+bucket — you never pass a size to `free`.
+
+2048 is the ceiling for a reason. Each bucket stores its header (slot bitmap
+and bookkeeping) at the end of the same page as its slots, so the slots and the
+header must share 4096 bytes. The slot count is sized to leave room for that
+header — which is why the largest class fits exactly one 2048-byte slot per
+page (the other ~2KB holds the header and unavoidable slack). A 4096-byte class
+would need the whole page for a single slot with nothing left for the header, so
+those sizes route to the large list instead.
+
+---
+
+## Alignment
+
+Alignment is determined by the size class and the backing — there is no
+`aligned_alloc`-style request, and over-aligned types (alignment greater than
+what the size class provides) are not supported.
+
+| Backing          | Guaranteed alignment                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------------- |
+| `libc_backing()` | at least `min(size_class, 16)` — 8 B for the 8-byte class, 16 B otherwise; large allocations 16 B |
+| `mmap_backing()` | the full size class (page base is page-aligned); large allocations page-aligned                   |
+
+The guarantee is the floor. In practice the C library often hands back a more
+strongly aligned page, so you may observe higher alignment under `libc_backing`,
+but do not rely on more than the table above. 16 bytes matches `max_align_t` on
+common 64-bit ABIs, so ordinary scalar and struct types are fine; SIMD or
+cache-line-aligned types that need 32/64-byte alignment are not guaranteed under
+`libc_backing`.
+
+`gpa_malloc` does not zero the memory it returns — initialize what you allocate.
+(Freed slots are currently zeroed as a use-after-free aid, which can make fresh
+allocations happen to read as zero, but that is an internal detail, not a
+contract.)
 
 ---
 
@@ -201,8 +245,8 @@ two >= your requested size:
 | 33 – 64 bytes | 64    |
 | … and so on   | …     |
 
-So `class 8` means something 1–8 bytes — likely a small struct or scalar.
-`class 64` means something 33–64 bytes — a medium struct.
+So `class 8` means something 1–8 bytes — likely a small struct or scalar. `class 64`
+means something 33–64 bytes — a medium struct.
 
 **slot** — the position of that allocation within the class's page, in allocation
 order. Slot 0 was the first allocation of that class, slot 1 the second, and so on.
@@ -236,54 +280,38 @@ Wrap progressively smaller blocks until the leak isolates to a single allocation
 The slot number gives you allocation order within that class — useful when the
 same struct type leaks multiple times.
 
+---
+
 ## Building Tests
 
-```sh
+```
 # fetch TestCracks
 curl -sL https://raw.githubusercontent.com/qa3-tech/TestCracks/main/include/testcracks.h -o testcracks.h
 curl -sL https://raw.githubusercontent.com/qa3-tech/TestCracks/main/src/testcracks.c    -o testcracks.c
 
-# build and run
-gcc -std=c23 -Wall -Wextra -Werror -o test_gpa test_gpa.c testcracks.c
+# build and run — main.c and second_tu.c both include gpa.h
+gcc -std=c23 -Wall -Wextra -Werror -o test_gpa main.c second_tu.c testcracks.c
 ./test_gpa
 ```
 
-Expected output:
-
-```
-=== Basics ===
-  ✓ clean alloc and free
-  ✓ allocate array
-  ✓ null free is safe
-
-=== Leak Detection ===
-  ✓ single leak detected
-  ✓ multiple leaks detected
-  ✓ large allocation leak
-
-... (17 tests total)
-
-17/17 passed, 0 failed, 0 skipped
-```
-
----
-
-## Using with Zig build system
-
-```zig
-// build.zig
-exe.addCSourceFile(.{
-    .file  = b.path("src/myapp.c"),
-    .flags = &[_][]const u8{"-std=c23"},
-});
-exe.linkLibC();
-```
-
-No special configuration needed — `gpa.h` is a single header.
+Linking `main.c` and `second_tu.c` together is itself the regression guard for the
+`static inline` design: if `gpa.h` ever reverts to external linkage, this build fails
+with `multiple definition of ...` before any test runs.
 
 ---
 
 ## Limitations
 
-- POSIX only for `mmap_backing()`; `libc_backing()` works everywhere
-- No stack trace capture on alloc/free (requires platform unwinding — out of scope)
+- **Single-threaded.** An `Allocator` holds mutable state with no locking. Do not
+  share one across threads; give each thread its own, or add external
+  synchronization.
+- **No over-alignment.** Alignment follows the size class and backing (see
+  [Alignment](#alignment)); there is no `aligned_alloc`-style request.
+- **Large double-free is not caught.** Freeing a >2048-byte allocation twice is
+  reported as an unknown-pointer free, not a double-free, and does not abort (see
+  [Guarantees](#guarantees)).
+- **Bookkeeping uses libc.** Internal metadata (the allocator state and
+  large-allocation nodes) comes from `malloc`/`calloc` regardless of the backing;
+  only the pages themselves come from the backing.
+- POSIX only for `mmap_backing()`; `libc_backing()` works everywhere.
+- No stack-trace capture on alloc/free (requires platform unwinding — out of scope).
